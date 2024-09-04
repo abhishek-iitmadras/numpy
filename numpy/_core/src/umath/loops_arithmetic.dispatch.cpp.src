@@ -9,6 +9,8 @@
 #include <limits>
 #include "simd/simd.h"
 #include "lowlevel_strided_loops.h"
+#include "numpy/npy_math.h"  // For npy_set_floatstatus_*
+#include "Python.h"  // For PyErr_SetString and PyExc_FloatingPointError
 #include <cstdio>  // For std::fprintf and std::abort
 
 namespace hn = hwy::HWY_NAMESPACE;
@@ -41,20 +43,34 @@ namespace hn = hwy::HWY_NAMESPACE;
 template <typename T>
 void simd_divide_by_scalar_contig_signed(T* src, T scalar, T* dst, npy_intp len, hn::ScalableTag<T> tag) {
     const int lanes = hn::Lanes(tag);
-    // Special case for division by -1 to handle overflow
-    if (std::is_signed<T>::value && scalar == static_cast<T>(-1)) {
+    bool raise_overflow = false;  // Flag to track overflow
+    bool raise_divbyzero = false; // Flag to track divide-by-zero
+
+    if (scalar == 0) {
+        // Handle divide-by-zero case
+        for (; len >= lanes; len -= lanes, src += lanes, dst += lanes) {
+            auto zero_vec = hn::Zero(tag);
+            hn::Store(zero_vec, tag, dst);
+        }
+        for (; len > 0; --len, ++src, ++dst) {
+            *dst = 0;
+        }
+        raise_divbyzero = true;
+    } 
+    else if (scalar == static_cast<T>(-1)) {
+        // Handle division by -1 with possible overflow
         auto vec_min_val = hn::Set(tag, std::numeric_limits<T>::min());
-        bool raise_overflow = false;
 
         for (; len >= lanes; len -= lanes, src += lanes, dst += lanes) {
             auto vec_src = hn::Load(tag, src);
             auto is_min_val = hn::Eq(vec_src, vec_min_val);
 
-            // Apply negation, taking care of overflow
-            auto vec_res = hn::IfThenElse(is_min_val, vec_min_val, hn::Sub(hn::Zero(tag), vec_src));
+            // Apply negation using hn::Neg
+            auto vec_res = hn::IfThenElse(is_min_val, vec_min_val, hn::Neg(vec_src));
             hn::Store(vec_res, tag, dst);
 
-            if (hn::AllTrue(tag, is_min_val)) {
+            // Check if any value is minimum to raise overflow
+            if (!hn::AllTrue(tag, hn::Not(is_min_val))) {
                 raise_overflow = true;
             }
         }
@@ -68,18 +84,14 @@ void simd_divide_by_scalar_contig_signed(T* src, T scalar, T* dst, npy_intp len,
                 *dst = -*src;
             }
         }
-
-        if (raise_overflow) {
-            npy_set_floatstatus_overflow();
-        }
-    } else {
+    } 
+    else {
         // General case for scalar division
         auto vec_scalar = hn::Set(tag, scalar);
         for (; len >= lanes; len -= lanes, src += lanes, dst += lanes) {
             auto vec_src = hn::Load(tag, src);
-            auto vec_res = hn::Div(vec_src, vec_scalar);
 
-            // Floor adjust for signed division
+            auto vec_res = hn::Div(vec_src, vec_scalar);
             auto vec_mul = hn::Mul(vec_res, vec_scalar);
             auto remainder_check = hn::Ne(vec_src, vec_mul);
 
@@ -87,6 +99,7 @@ void simd_divide_by_scalar_contig_signed(T* src, T scalar, T* dst, npy_intp len,
             auto vec_nsign_scalar = hn::Lt(vec_scalar, hn::Zero(tag));
             auto diff_sign = hn::Xor(vec_nsign_src, vec_nsign_scalar);
 
+            // Floor adjust for signed division
             vec_res = hn::IfThenElse(hn::And(remainder_check, diff_sign), hn::Sub(vec_res, hn::Set(tag, 1)), vec_res);
             hn::Store(vec_res, tag, dst);
         }
@@ -96,35 +109,55 @@ void simd_divide_by_scalar_contig_signed(T* src, T scalar, T* dst, npy_intp len,
             const T a = *src;
             T result = a / scalar;
 
-            // Floor adjust for signed division in scalar fallback
-            if (std::is_signed<T>::value && ((a > 0) != (scalar > 0)) && (result * scalar != a)) {
+            if ((a > 0) != (scalar > 0) && (result * scalar != a)) {
                 result--;
             }
             *dst = result;
         }
     }
+
+    // Set float status for overflow or divide-by-zero
+    if (raise_overflow) {
+        npy_set_floatstatus_overflow();
+    }
+    if (raise_divbyzero) {
+        npy_set_floatstatus_divbyzero();
+    }
+
     SIMD_CLEANUP();
 }
+
 
 template <typename T>
 void simd_divide_by_scalar_contig_unsigned(T* src, T scalar, T* dst, npy_intp len, hn::ScalableTag<T> tag) {
     const int lanes = hn::Lanes(tag);
 
-    // Precompute the reciprocal (1 / scalar) for optimized division
-    auto vec_reciprocal = hn::Set(tag, static_cast<T>(1) / scalar);
-
     // Vectorized loop for division
     for (; len >= lanes; len -= lanes, src += lanes, dst += lanes) {
         auto vec_src = hn::Load(tag, src);
-        // Perform multiplication by reciprocal (optimized division)
-        auto vec_res = hn::Mul(vec_src, vec_reciprocal);
-        hn::Store(vec_res, tag, dst);
+
+        // Ensure divisor is not zero and handle it separately
+        if (scalar == 0) {
+            // Handle divide by zero according to the expected behavior
+            auto zero_vec = hn::Zero(tag);
+            hn::Store(zero_vec, tag, dst);
+            npy_set_floatstatus_divbyzero();
+        } else {
+            // Perform direct division
+            auto vec_res = hn::Div(vec_src, hn::Set(tag, scalar));
+            hn::Store(vec_res, tag, dst);
+        }
     }
 
     // Scalar fallback for remaining elements
     for (; len > 0; --len, ++src, ++dst) {
         const T a = *src;
-        *dst = a / scalar;  // Fallback to scalar division
+        if (scalar == 0) {
+            *dst = 0;  // Handle divide by zero case
+            npy_set_floatstatus_divbyzero();
+        } else {
+            *dst = a / scalar;  // Fallback to scalar division
+        }
     }
     SIMD_CLEANUP();
 }
