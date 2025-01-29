@@ -506,6 +506,10 @@ NPY_INPLACE @type@ npy_logaddexp2@c@(@type@ x, @type@ y)
     }
 }
 
+#if defined(__aarch64__) && defined(__clang__)
+#define NPY_HANDLE_FPE_ARM64_CLANG 1
+#endif
+
 /*
  * Wrapper function for remainder edge cases
  * Internally calls npy_divmod*
@@ -514,6 +518,13 @@ NPY_INPLACE @type@
 npy_remainder@c@(@type@ a, @type@ b)
 {
     @type@ mod;
+#if NPY_HANDLE_FPE_ARM64_CLANG
+    /* Special handling for ARM64 with Clang to avoid FPE with float128 */
+    if (sizeof(@type@) == sizeof(long double) && 
+        (npy_isnan(a) || npy_isnan(b))) {
+        return npy_fmod@c@(a, b);  /* Let hardware handle NaN modulo */
+    }
+#endif
     if (NPY_UNLIKELY(!b)) {
         /*
          * in2 == 0 (and not NaN): normal fmod will give the correct
@@ -531,6 +542,13 @@ npy_remainder@c@(@type@ a, @type@ b)
 NPY_INPLACE @type@
 npy_floor_divide@c@(@type@ a, @type@ b) {
     @type@ div, mod;
+#if NPY_HANDLE_FPE_ARM64_CLANG
+    /* Special handling for ARM64 with Clang to avoid FPE with float128 */
+    if (sizeof(@type@) == sizeof(long double) && 
+        (npy_isnan(a) || npy_isnan(b))) {
+        return a / b;
+    }
+#endif
     if (NPY_UNLIKELY(!b)) {
         /*
          * in2 == 0 (and not NaN): normal division will give the correct
